@@ -8,6 +8,7 @@ const passport = require('passport');
 const GitHubStrategy = require('passport-github2').Strategy;
 const session = require('express-session');
 const crypto = require('crypto');
+const { createMcpRouter } = require('./mcp-server');
 
 const app = express();
 const server = http.createServer(app);
@@ -21,17 +22,9 @@ const refreshTokens = new Map();
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-
-app.use(session({
-  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' }
-}));
-
+app.use(session({ secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' } }));
 app.use(passport.initialize());
 app.use(passport.session());
-
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
 
@@ -41,53 +34,39 @@ passport.use(new GitHubStrategy({
   callbackURL: process.env.GITHUB_CALLBACK_URL || 'https://koyeb-web-terminal.koyeb.app/auth/github/callback',
   passReqToCallback: true
 }, (req, accessToken, refreshToken, profile, done) => {
-  if (!dynamicOwnerUsername) {
-    dynamicOwnerUsername = profile.username.toLowerCase();
-    console.log(`[AUTH] Owner di-set ke: ${dynamicOwnerUsername}`);
-  }
+  if (!dynamicOwnerUsername) dynamicOwnerUsername = profile.username.toLowerCase();
   if (profile.username.toLowerCase() === dynamicOwnerUsername) return done(null, profile);
-  console.log(`[AUTH] Akses ditolak untuk user: ${profile.username}`);
   return done(null, false, { message: 'Akses ditolak: Anda bukan owner dari terminal ini.' });
 }));
 
-function ensureAuthenticated(req, res, next) {
-  if (req.isAuthenticated()) return next();
-  res.redirect('/auth/github');
-}
-
+function ensureAuthenticated(req, res, next) { if (req.isAuthenticated()) return next(); res.redirect('/auth/github'); }
 app.get('/auth/github', passport.authenticate('github', { scope: ['user:email', 'repo'] }));
 app.get('/auth/github/callback', passport.authenticate('github', { failureRedirect: '/' }), (req, res) => res.redirect('/'));
-app.get('/logout', (req, res) => {
-  dynamicOwnerUsername = null;
-  req.logout(() => res.redirect('/'));
-});
-
+app.get('/logout', (req, res) => { dynamicOwnerUsername = null; req.logout(() => res.redirect('/')); });
 app.get('/ping', (req, res) => res.status(200).send('OK - Server is Alive'));
 
-// -----------------------------------------------------------------
-// OAuth 2.0 / DCR FOR CHATGPT MCP CONNECTOR
-// -----------------------------------------------------------------
 function baseUrl(req) {
   const forwardedProto = req.get('x-forwarded-proto');
   const proto = forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol;
   return `${proto}://${req.get('host')}`;
 }
 function randomToken(prefix) { return `${prefix}_${crypto.randomBytes(32).toString('hex')}`; }
+function safeEqual(a, b) { if (typeof a !== 'string' || typeof b !== 'string') return false; const aa = Buffer.from(a); const bb = Buffer.from(b); return aa.length === bb.length && crypto.timingSafeEqual(aa, bb); }
 function cleanupOAuthState() {
   const now = Date.now();
-  for (const [key, value] of authorizationCodes) if (value.expiresAt <= now) authorizationCodes.delete(key);
-  for (const [key, value] of accessTokens) if (value.expiresAt <= now) accessTokens.delete(key);
-  for (const [key, value] of refreshTokens) if (value.expiresAt <= now) refreshTokens.delete(key);
+  for (const [k, v] of authorizationCodes) if (v.expiresAt <= now) authorizationCodes.delete(k);
+  for (const [k, v] of accessTokens) if (v.expiresAt <= now) accessTokens.delete(k);
+  for (const [k, v] of refreshTokens) if (v.expiresAt <= now) refreshTokens.delete(k);
 }
 setInterval(cleanupOAuthState, 60 * 1000).unref();
 
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
   const base = baseUrl(req);
-  res.json({ issuer: base, authorization_endpoint: `${base}/oauth/auth`, token_endpoint: `${base}/oauth/token`, registration_endpoint: `${base}/oauth/register`, response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none'], code_challenge_methods_supported: ['S256'], scopes_supported: ['terminal'] });
+  res.json({ issuer: base, authorization_endpoint: `${base}/oauth/auth`, token_endpoint: `${base}/oauth/token`, registration_endpoint: `${base}/oauth/register`, response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic'], code_challenge_methods_supported: ['S256'], scopes_supported: ['terminal'] });
 });
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
   const base = baseUrl(req);
-  res.json({ resource: `${base}/mcp`, authorization_servers: [base] });
+  res.json({ resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: ['terminal'], bearer_methods_supported: ['header'] });
 });
 
 app.post('/oauth/register', (req, res) => {
@@ -105,26 +84,21 @@ function getClient(req) {
   if (auth && auth.startsWith('Basic ')) {
     try {
       const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
-      const separator = decoded.indexOf(':');
-      if (separator >= 0) {
-        const client = oauthClients.get(decoded.slice(0, separator));
-        if (client && safeEqual(client.clientSecret, decoded.slice(separator + 1))) return client;
-      }
+      const i = decoded.indexOf(':');
+      if (i >= 0) { const c = oauthClients.get(decoded.slice(0, i)); if (c && safeEqual(c.clientSecret, decoded.slice(i + 1))) return c; }
     } catch (_) {}
   }
-  const client = oauthClients.get(req.body.client_id || req.query.client_id);
-  if (client && (!req.body.client_secret || safeEqual(client.clientSecret, req.body.client_secret))) return client;
+  const id = req.body.client_id || req.query.client_id;
+  const secret = req.body.client_secret;
+  const c = oauthClients.get(id);
+  if (c && safeEqual(c.clientSecret, secret)) return c;
   return null;
-}
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const aa = Buffer.from(a); const bb = Buffer.from(b);
-  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
 
 function passwordPage(res, fields, error = '') {
-  const hidden = Object.entries(fields).map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}">`).join('');
-  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;margin:60px auto;max-width:430px;background:#0d1117;color:#c9d1d9;padding:30px"><h2>Login Terminal</h2><p>Masukkan password untuk melanjutkan koneksi ChatGPT.</p>${error ? `<p style="color:#ff6b6b">${error}</p>` : ''}<form action="/oauth/login" method="POST">${hidden}<input type="password" name="terminal_password" placeholder="Password" autocomplete="current-password" required style="padding:12px;width:90%;margin:15px 0;border-radius:6px;border:1px solid #30363d"><button type="submit" style="padding:12px 24px;background:#10a37f;color:white;border:0;border-radius:6px;font-weight:bold">Login</button></form></body></html>`);
+  const esc = v => String(v || '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  const hidden = Object.entries(fields).map(([k,v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join('');
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;margin:60px auto;max-width:430px;background:#0d1117;color:#c9d1d9;padding:30px"><h2>Login Terminal</h2><p>Masukkan password untuk melanjutkan koneksi ChatGPT.</p>${error ? `<p style="color:#ff6b6b">${esc(error)}</p>` : ''}<form action="/oauth/login" method="POST">${hidden}<input type="password" name="terminal_password" placeholder="Password" autocomplete="current-password" required style="padding:12px;width:90%;margin:15px 0;border-radius:6px;border:1px solid #30363d"><button type="submit" style="padding:12px 24px;background:#10a37f;color:white;border:0;border-radius:6px;font-weight:bold">Login</button></form></body></html>`);
 }
 
 app.get('/oauth/auth', (req, res) => {
@@ -144,18 +118,15 @@ app.post('/oauth/login', (req, res) => {
   if (!client || !client.redirectUris.includes(redirect_uri) || code_challenge_method !== 'S256' || !code_challenge) return res.status(400).send('Permintaan OAuth tidak valid.');
   if (!configuredPassword) return res.status(500).send('TERMINAL_PASSWORD/SESSION_SECRET belum dikonfigurasi di Koyeb.');
   if (!safeEqual(terminal_password, configuredPassword)) return passwordPage(res, { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope }, 'Password salah.');
-
   const code = randomToken('code');
   authorizationCodes.set(code, { clientId: client_id, redirectUri: redirect_uri, codeChallenge: code_challenge, scope: scope || 'terminal', expiresAt: Date.now() + 5 * 60 * 1000 });
-  const url = new URL(redirect_uri);
-  url.searchParams.set('code', code);
-  if (state) url.searchParams.set('state', state);
-  console.log(`[OAUTH] Password accepted; authorization approved for ${client_id}`);
-  res.redirect(url.toString());
+  const url = new URL(redirect_uri); url.searchParams.set('code', code); if (state) url.searchParams.set('state', state);
+  console.log(`[OAUTH] Authorization approved for ${client_id}`); res.redirect(url.toString());
 });
 
 app.post('/oauth/token', (req, res) => {
   const grantType = req.body.grant_type;
+  console.log(`[OAUTH] Token request grant_type=${grantType || 'missing'} client_id=${req.body.client_id || 'basic'}`);
   const client = getClient(req);
   if (!client) return res.status(401).json({ error: 'invalid_client' });
   if (grantType === 'authorization_code') {
@@ -169,15 +140,17 @@ app.post('/oauth/token', (req, res) => {
     const accessToken = randomToken('access'); const refreshToken = randomToken('refresh');
     accessTokens.set(accessToken, { clientId: client.clientId, scope: record.scope, expiresAt: Date.now() + 3600 * 1000 });
     refreshTokens.set(refreshToken, { clientId: client.clientId, scope: record.scope, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
+    console.log(`[OAUTH] Access token issued for ${client.clientId}`);
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: refreshToken, scope: record.scope });
   }
   if (grantType === 'refresh_token') {
-    const oldRefresh = req.body.refresh_token; const record = refreshTokens.get(oldRefresh);
+    const record = refreshTokens.get(req.body.refresh_token);
     if (!record || record.expiresAt <= Date.now() || record.clientId !== client.clientId) return res.status(400).json({ error: 'invalid_grant' });
-    refreshTokens.delete(oldRefresh);
+    refreshTokens.delete(req.body.refresh_token);
     const accessToken = randomToken('access'); const refreshToken = randomToken('refresh');
     accessTokens.set(accessToken, { clientId: client.clientId, scope: record.scope, expiresAt: Date.now() + 3600 * 1000 });
     refreshTokens.set(refreshToken, { clientId: client.clientId, scope: record.scope, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
+    console.log(`[OAUTH] Refresh token rotated for ${client.clientId}`);
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: refreshToken, scope: record.scope });
   }
   return res.status(400).json({ error: 'unsupported_grant_type' });
@@ -185,29 +158,27 @@ app.post('/oauth/token', (req, res) => {
 
 function requireBearer(req, res, next) {
   const header = req.get('authorization') || '';
-  if (!header.startsWith('Bearer ')) { res.set('WWW-Authenticate', 'Bearer'); return res.status(401).json({ error: 'unauthorized', error_description: 'Bearer token required' }); }
+  if (!header.startsWith('Bearer ')) { res.set('WWW-Authenticate', `Bearer realm="mcp", resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`); return res.status(401).json({ error: 'unauthorized', error_description: 'Bearer token required' }); }
   const token = header.slice(7).trim(); const record = accessTokens.get(token);
   if (!record || record.expiresAt <= Date.now()) { res.set('WWW-Authenticate', 'Bearer error="invalid_token"'); return res.status(401).json({ error: 'invalid_token' }); }
   req.oauth = record; next();
 }
-app.get('/mcp/sse', requireBearer, (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('Connection', 'keep-alive'); res.flushHeaders();
-  res.write(`data: ${JSON.stringify({ type: 'connected', message: 'MCP Server siap dan terhubung dengan ChatGPT!' })}\n\n`);
-});
-app.get('/mcp', requireBearer, (req, res) => res.json({ ok: true, service: 'Koyeb Web Terminal MCP', scope: req.oauth.scope }));
+
+const mcpRouter = createMcpRouter();
+app.use('/mcp', requireBearer, mcpRouter);
 
 app.use('/', ensureAuthenticated, express.static('public'));
 const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
 io.on('connection', socket => {
-  console.log('[TERMINAL] Koneksi WebSocket baru ke Terminal');
   const ptyProcess = pty.spawn(shell, [], { name: 'xterm-color', cols: 80, rows: 30, cwd: process.env.HOME || '/app', env: process.env });
   ptyProcess.onData(data => socket.emit('output', data)); socket.on('input', data => ptyProcess.write(data)); socket.on('resize', size => ptyProcess.resize(size.cols, size.rows)); socket.on('disconnect', () => ptyProcess.kill());
 });
 
 function startUptimeBots() {
-  const appUrl = process.env.RENDER_EXTERNAL_URL || process.env.APP_URL || process.env.KOYEB_PUBLIC_URL || 'http://localhost:8000';
-  for (const minutes of [3, 4, 5]) setInterval(() => { const target = `${appUrl.includes('http') ? appUrl : 'https://' + appUrl}/ping`; const client = target.startsWith('https') ? https : http; client.get(target, res => console.log(`[Uptime Bot ${minutes}m] Ping status: ${res.statusCode}`)).on('error', () => {}); }, minutes * 60 * 1000);
+  const appUrl = process.env.APP_URL || process.env.KOYEB_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || 'http://localhost:8000';
+  for (const minutes of [3, 4, 5]) setInterval(() => { const target = `${appUrl.replace(/\/$/, '')}/ping`; const client = target.startsWith('https://') ? https : http; client.get(target, res => console.log(`[Uptime Bot ${minutes}m] Ping status: ${res.statusCode}`)).on('error', err => console.log(`[Uptime Bot ${minutes}m] Ping error: ${err.message}`)); }, minutes * 60 * 1000);
   console.log('🤖 3 Robot Uptime Ping berhasil diaktifkan!');
 }
+
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => { console.log(`✅ Server berjalan di port ${PORT}`); startUptimeBots(); });

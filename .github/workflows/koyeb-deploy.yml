@@ -1,0 +1,52 @@
+name: Deploy to Koyeb
+
+on:
+  push:
+    branches:
+      - main
+      - fix/mcp-terminal-oauth
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: koyeb-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate server syntax
+        run: node --check server.js && node --check mcp-server.js
+
+      - name: Install and configure Koyeb CLI
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: koyeb-community/koyeb-actions@v2
+        with:
+          api_token: ${{ secrets.KOYEB_API_TOKEN }}
+
+      - name: Deploy to Koyeb
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          KOYEB_APP_NAME: ${{ vars.KOYEB_APP_NAME }}
+          KOYEB_SERVICE_NAME: ${{ vars.KOYEB_SERVICE_NAME }}
+        run: |
+          if [ -z "$KOYEB_APP_NAME" ] || [ -z "$KOYEB_SERVICE_NAME" ]; then
+            echo "KOYEB_APP_NAME and KOYEB_SERVICE_NAME repository variables are required."
+            exit 1
+          fi
+          koyeb services redeploy "$KOYEB_SERVICE_NAME" --app "$KOYEB_APP_NAME" --wait
